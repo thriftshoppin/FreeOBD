@@ -4,3 +4,6 @@
 .claude/
 *.exe
 *.log
+
+probe-result*.txt
+private/

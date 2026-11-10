@@ -16,13 +16,47 @@ function Send-Obd([string]$cmd, [int]$to = 3000) {
     }
     ($buf -replace '>', '').Trim()
 }
-function Get-Bytes([string]$resp, [string]$prefix) {
+function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+    # CAN cars often have several modules answer the same request at once (normal, not an
+    # error). With headers on (ATH1) every line is tagged with its 3-char source CAN ID, so we
+    # bucket lines by that header, reassemble each bucket's own ISO-TP payload (single frame or
+    # first+consecutive frames), and return whichever bucket's payload actually starts with the
+    # response we asked for. This is what stops one module's reply from corrupting another's.
+    $buckets = [ordered]@{}
     foreach ($line in ($resp -split "[\r\n]+")) {
-        $h = ($line -replace '\s', '').ToUpper(); $k = $h.IndexOf($prefix)
-        if ($k -ge 0) { $d = $h.Substring($k + $prefix.Length)
-            if ($d.Length -ge 2) { return ,@(for ($n = 0; $n + 1 -lt $d.Length; $n += 2) { [Convert]::ToInt32($d.Substring($n, 2), 16) }) } }
+        $h = ($line -replace '[^0-9A-Fa-f]', '').ToUpper()
+        if ($h.Length -lt 5) { continue }
+        $hdr = $h.Substring(0, 3); $rest = $h.Substring(3)
+        if (-not $buckets.Contains($hdr)) { $buckets[$hdr] = New-Object System.Collections.Generic.List[string] }
+        $buckets[$hdr].Add($rest)
+    }
+    foreach ($hdr in $buckets.Keys) {
+        $frames = $buckets[$hdr]; $f0 = $frames[0]
+        if ($f0.Length -lt 2) { continue }
+        $pci = [Convert]::ToInt32($f0.Substring(0, 1), 16); $payload = $null
+        if ($pci -eq 0) {
+            $len = [Convert]::ToInt32($f0.Substring(1, 1), 16); $data = $f0.Substring(2)
+            if ($data.Length -ge $len * 2) { $payload = $data.Substring(0, $len * 2) }
+        } elseif ($pci -eq 1) {
+            $len = ([Convert]::ToInt32($f0.Substring(1, 1), 16) -shl 8) + [Convert]::ToInt32($f0.Substring(2, 2), 16)
+            $acc = $f0.Substring(4)
+            for ($i = 1; $i -lt $frames.Count -and ($acc.Length / 2) -lt $len; $i++) {
+                $fr = $frames[$i]; if ($fr.Length -lt 2) { continue }
+                if ([Convert]::ToInt32($fr.Substring(0, 1), 16) -ne 2) { continue }
+                $acc += $fr.Substring(2)
+            }
+            if (($acc.Length / 2) -ge $len) { $payload = $acc.Substring(0, $len * 2) }
+        }
+        if ($payload -and $payload.StartsWith($expectPrefix.ToUpper())) { return $payload }
     }
     $null
+}
+function Get-Bytes([string]$resp, [string]$prefix) {
+    $payload = Get-EcuPayload $resp $prefix
+    if (-not $payload) { return $null }
+    $d = $payload.Substring($prefix.Length)
+    if ($d.Length -lt 2) { return $null }
+    ,@(for ($n = 0; $n + 1 -lt $d.Length; $n += 2) { [Convert]::ToInt32($d.Substring($n, 2), 16) })
 }
 $Pids = @(
  @{P='0104';N='Engine load';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
@@ -45,6 +79,37 @@ $Pids = @(
  @{P='0142';N='Module voltage';U='V';F={param($a)[math]::Round((256*$a[0]+$a[1])/1000,2)}}
 )
 function Read-Pid($d) { $b = Get-Bytes (Send-Obd $d.P 1500) ('41' + $d.P.Substring(2)); if ($null -eq $b) { $null } else { & $d.F $b } }
+
+# Mode 06 on-board monitor test results: standard read-only PID family (same as Mode 01/09), no security access.
+function Get-SupportedMids {
+    $b = Get-Bytes (Send-Obd '0600' 3000) '4600'
+    if (-not $b) { return @() }
+    $mids = @()
+    for ($i = 0; $i -lt $b.Count; $i++) { for ($bit = 7; $bit -ge 0; $bit--) { if ($b[$i] -band (1 -shl $bit)) { $mids += ($i*8 + (8 - $bit)) } } }
+    $mids
+}
+function Get-Mode06Raw([int]$mid) {
+    # Raw hex payload for one MID. Deliberately not split into TID/UAS/value/min/max: per
+    # ISO 15031-5 each record's length depends on the UAS byte, and a fixed-width guess would
+    # silently misalign and corrupt everything after the first record that doesn't match it.
+    Get-EcuPayload (Send-Obd ("06{0:X2}" -f $mid) 4000) ("46{0:X2}" -f $mid)
+}
+# Vehicle profile: free public VIN decode, NHTSA vPIC API, no key needed.
+function Get-Vin {
+    $payload = Get-EcuPayload (Send-Obd '0902' 5000) '4902'
+    # payload = "4902" + 1-byte item count + 17 ASCII bytes (VIN) = 20 bytes = 40 hex chars
+    if (-not $payload -or $payload.Length -lt 40) { return $null }
+    $d = $payload.Substring(6)
+    $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k, 2), 16); if ($n -ge 32 -and $n -le 126) { [char]$n } else { '?' } }
+    (-join $chars).Substring(0, 17)
+}
+function Get-VinInfo([string]$vin) {
+    try {
+        $resp = Invoke-RestMethod -Uri "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/$vin`?format=json" -TimeoutSec 8
+        $row = $resp.Results[0]
+        [pscustomobject]@{ Year = $row.ModelYear; Make = $row.Make; Model = $row.Model; Engine = "$($row.EngineCylinders)cyl $($row.DisplacementL)L $($row.FuelTypePrimary)".Trim(); Error = $row.ErrorText }
+    } catch { $null }
+}
 function ConvertTo-Dtc([int]$hi, [int]$lo) { '{0}{1}{2:X}{3:X2}' -f ('P','C','B','U')[($hi -shr 6) -band 3], (($hi -shr 4) -band 3), ($hi -band 15), $lo }
 function Describe-Dtc([string]$c) {
     $map = @{ P0171='System too lean, bank 1'; P0174='System too lean, bank 2'; P0172='System too rich, bank 1'; P0175='System too rich, bank 2';
@@ -66,7 +131,7 @@ $bc = New-Object Windows.Forms.Button; $bc.Text = 'Connect'; $bc.Location = '148
 $st = New-Object Windows.Forms.Label; $st.Text = 'Not connected'; $st.Location = '250,12'; $st.AutoSize = $true
 $top.Controls.AddRange(@($lp, $cb, $bc, $st))
 $tabs = New-Object Windows.Forms.TabControl; $tabs.Dock = 'Fill'
-foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
+foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance','Vehicle') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
 $f.Controls.Add($tabs); $f.Controls.Add($top)
 $tabs.BringToFront()
 
@@ -107,6 +172,14 @@ $pl = New-Object Windows.Forms.Label; $pl.Location = '10,50'; $pl.Size = '670,20
 $pl.Text = 'Press Arm run, come to a stop on a closed course, then launch. Q-mile and 0-60 times are estimates (Bluetooth is slow).'
 $tabs.TabPages[4].Controls.AddRange(@($bp, $pl))
 
+# Vehicle (VIN profile + Mode 06 monitor tests)
+$bvin = New-Object Windows.Forms.Button; $bvin.Text = 'Identify vehicle (VIN)'; $bvin.Location = '10,10'; $bvin.Width = 170
+$lvin = New-Object Windows.Forms.Label; $lvin.Location = '10,45'; $lvin.Size = '670,45'; $lvin.Text = 'Not identified yet.'
+$bm6 = New-Object Windows.Forms.Button; $bm6.Text = 'Read monitor tests (Mode 06)'; $bm6.Location = '10,100'; $bm6.Width = 210
+$lm6 = New-Object Windows.Forms.ListView; $lm6.View = 'Details'; $lm6.Location = '10,135'; $lm6.Size = '670,300'; $lm6.FullRowSelect = $true; $lm6.GridLines = $true
+[void]$lm6.Columns.Add('MID', 55); [void]$lm6.Columns.Add('Raw payload (not decoded - see tooltip/README)', 600)
+$tabs.TabPages[5].Controls.AddRange(@($bvin, $lvin, $bm6, $lm6))
+
 # ---------- behavior ----------
 function Set-Status([string]$m) { $st.Text = $m }
 function Update-Bar($name, $val) {
@@ -124,7 +197,7 @@ $bc.Add_Click({
         $s = New-Object System.IO.Ports.SerialPort $cb.SelectedItem, 38400, 'None', 8, 'One'; $s.ReadTimeout = 2000; $s.WriteTimeout = 2000; $s.Open(); $script:sp = $s
         $r = Send-Obd 'ATZ' 3000
         if ($r -notmatch 'ELM|OBD') { throw "No ELM327 response" }
-        foreach ($c in 'ATE0','ATL0','ATS0','ATH0','ATSP0') { [void](Send-Obd $c) }
+        foreach ($c in 'ATE0','ATL0','ATS0','ATH1','ATCAF1','ATSP0') { [void](Send-Obd $c) }
         Set-Status 'Finding supported sensors (a few seconds)...'; $f.Refresh()
         $script:sup = @(); $lv.Items.Clear()
         foreach ($d in $Pids) { if ($null -ne (Read-Pid $d)) { $script:sup += $d; $it = $lv.Items.Add($d.N); [void]$it.SubItems.Add('--'); [void]$it.SubItems.Add($d.U) } }
@@ -137,11 +210,11 @@ $br.Add_Click({
     $timer.Stop(); $lc.Items.Clear()
     foreach ($m in @(@('03','Stored'), @('07','Pending'))) {
         $hdr = '{0:X2}' -f ([Convert]::ToInt32($m[0], 16) + 0x40)
-        foreach ($line in ((Send-Obd $m[0] 5000) -split "[\r\n]+")) {
-            $h = ($line -replace '\s', '').ToUpper()
-            if ($h.StartsWith($hdr)) { $d = $h.Substring(2); if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
-                for ($k = 0; $k + 3 -lt $d.Length; $k += 4) { $hi = [Convert]::ToInt32($d.Substring($k, 2), 16); $lo = [Convert]::ToInt32($d.Substring($k + 2, 2), 16)
-                    if ($hi -or $lo) { $c = ConvertTo-Dtc $hi $lo; $it = $lc.Items.Add($c); [void]$it.SubItems.Add($m[1]); [void]$it.SubItems.Add((Describe-Dtc $c)) } } }
+        $payload = Get-EcuPayload (Send-Obd $m[0] 5000) $hdr
+        if ($payload) {
+            $d = $payload.Substring(2); if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
+            for ($k = 0; $k + 3 -lt $d.Length; $k += 4) { $hi = [Convert]::ToInt32($d.Substring($k, 2), 16); $lo = [Convert]::ToInt32($d.Substring($k + 2, 2), 16)
+                if ($hi -or $lo) { $c = ConvertTo-Dtc $hi $lo; $it = $lc.Items.Add($c); [void]$it.SubItems.Add($m[1]); [void]$it.SubItems.Add((Describe-Dtc $c)) } }
         }
     }
     if ($lc.Items.Count -eq 0) { [void]$lc.Items.Add('(none)') }
@@ -165,6 +238,29 @@ $bp.Add_Click({
     if (-not $script:sp) { Set-Status 'Connect first.'; return }
     $script:perf = @{ State = 'stop'; Dist = 0.0; Last = 0.0; LastV = 0.0; T60 = $null; TQ = $null; Top = 0.0; SW = $null }
     $pl.Text = 'Waiting for the car to be stationary...'
+})
+
+$bvin.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $timer.Stop(); $lvin.Text = 'Reading VIN...'; $f.Refresh()
+    $vin = Get-Vin
+    if (-not $vin) { $lvin.Text = 'VIN not available from this vehicle.'; $timer.Start(); return }
+    $lvin.Text = "VIN: $vin`r`nLooking up vehicle profile..."; $f.Refresh()
+    $info = Get-VinInfo $vin
+    if ($info -and ($info.Make -or $info.Error -match '^0\b')) { $lvin.Text = "VIN: $vin`r`n$($info.Year) $($info.Make) $($info.Model) - $($info.Engine)" }
+    elseif ($info) { $lvin.Text = "VIN: $vin`r`nLookup: $($info.Error)" }
+    else { $lvin.Text = "VIN: $vin`r`n(no internet, or NHTSA API unreachable)" }
+    $timer.Start()
+})
+$bm6.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $timer.Stop(); $lm6.Items.Clear(); Set-Status 'Reading Mode 06 monitor tests...'; $f.Refresh()
+    foreach ($mid in (Get-SupportedMids)) {
+        $p = Get-Mode06Raw $mid
+        if ($p) { $it = $lm6.Items.Add(('0x{0:X2}' -f $mid)); [void]$it.SubItems.Add($p.Substring(4)) }
+    }
+    if ($lm6.Items.Count -eq 0) { [void]$lm6.Items.Add('(no Mode 06 data reported by this vehicle)') }
+    Set-Status 'Monitor tests read.'; $timer.Start()
 })
 
 $timer = New-Object Windows.Forms.Timer; $timer.Interval = 20

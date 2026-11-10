@@ -8,7 +8,7 @@
 param(
     [string]$Port,
     [int]$Baud = 38400,
-    [ValidateSet('Menu','Live','Codes','Info','ClearCodes','Trims','Freeze','Monitors','Log','Perf')][string]$Mode = 'Menu',
+    [ValidateSet('Menu','Live','Codes','Info','ClearCodes','Trims','Freeze','Monitors','Mode06','Log','Perf')][string]$Mode = 'Menu',
     [string]$LogDir = (Join-Path $PSScriptRoot 'logs')
 )
 
@@ -28,19 +28,49 @@ function Send-Obd([System.IO.Ports.SerialPort]$sp, [string]$cmd, [int]$timeoutMs
     ($buf -replace '>', '').Trim()
 }
 
-function Get-Bytes([string]$resp, [string]$expectPrefix) {
-    # returns data bytes after the expected response header (e.g. "410C"), or $null
+function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+    # CAN cars often have several modules answer the same request at once (normal, not an
+    # error). With headers on (ATH1) every line is tagged with its 3-char source CAN ID, so we
+    # bucket lines by that header, reassemble each bucket's own ISO-TP payload (single frame or
+    # first+consecutive frames), and return whichever bucket's payload actually starts with the
+    # response we asked for. This is what stops one module's reply from corrupting another's.
+    $buckets = [ordered]@{}
     foreach ($line in ($resp -split "[\r\n]+")) {
-        $h = ($line -replace '\s', '').ToUpper()
-        $i = $h.IndexOf($expectPrefix)
-        if ($i -ge 0) {
-            $d = $h.Substring($i + $expectPrefix.Length)
-            if ($d.Length -ge 2) {
-                return ,@(for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { [Convert]::ToInt32($d.Substring($k, 2), 16) })
+        $h = ($line -replace '[^0-9A-Fa-f]', '').ToUpper()
+        if ($h.Length -lt 5) { continue }
+        $hdr = $h.Substring(0, 3); $rest = $h.Substring(3)
+        if (-not $buckets.Contains($hdr)) { $buckets[$hdr] = New-Object System.Collections.Generic.List[string] }
+        $buckets[$hdr].Add($rest)
+    }
+    foreach ($hdr in $buckets.Keys) {
+        $frames = $buckets[$hdr]; $f0 = $frames[0]
+        if ($f0.Length -lt 2) { continue }
+        $pci = [Convert]::ToInt32($f0.Substring(0, 1), 16); $payload = $null
+        if ($pci -eq 0) {
+            $len = [Convert]::ToInt32($f0.Substring(1, 1), 16); $data = $f0.Substring(2)
+            if ($data.Length -ge $len * 2) { $payload = $data.Substring(0, $len * 2) }
+        } elseif ($pci -eq 1) {
+            $len = ([Convert]::ToInt32($f0.Substring(1, 1), 16) -shl 8) + [Convert]::ToInt32($f0.Substring(2, 2), 16)
+            $acc = $f0.Substring(4)
+            for ($i = 1; $i -lt $frames.Count -and ($acc.Length / 2) -lt $len; $i++) {
+                $fr = $frames[$i]; if ($fr.Length -lt 2) { continue }
+                if ([Convert]::ToInt32($fr.Substring(0, 1), 16) -ne 2) { continue }
+                $acc += $fr.Substring(2)
             }
+            if (($acc.Length / 2) -ge $len) { $payload = $acc.Substring(0, $len * 2) }
         }
+        if ($payload -and $payload.StartsWith($expectPrefix.ToUpper())) { return $payload }
     }
     $null
+}
+
+function Get-Bytes([string]$resp, [string]$expectPrefix) {
+    # returns data bytes after the expected response header (e.g. "410C"), or $null
+    $payload = Get-EcuPayload $resp $expectPrefix
+    if (-not $payload) { return $null }
+    $d = $payload.Substring($expectPrefix.Length)
+    if ($d.Length -lt 2) { return $null }
+    ,@(for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { [Convert]::ToInt32($d.Substring($k, 2), 16) })
 }
 
 function Open-Elm {
@@ -60,7 +90,7 @@ function Open-Elm {
         $r = Send-Obd $sp 'ATZ' 3000
         if ($r -match 'ELM|OBD|V\d') {
             Write-Host "Adapter: $(($r -split "[\r\n]+" | Where-Object { $_ -match 'ELM|OBD' } | Select-Object -First 1)) on $($script:Port) @ $b baud"
-            foreach ($c in 'ATE0','ATL0','ATS0','ATH0','ATSP0') { [void](Send-Obd $sp $c) }
+            foreach ($c in 'ATE0','ATL0','ATS0','ATH1','ATCAF1','ATSP0') { [void](Send-Obd $sp $c) }
             return $sp
         }
         $sp.Close(); $sp.Dispose()
@@ -195,6 +225,45 @@ function Show-Monitors($sp) {
     }
 }
 
+# ---------- Mode 06: on-board monitor test results (raw, per SAE J1979 CAN format) ----------
+# This is a standard read-only PID request, same family as Mode 01/09. No security access of any kind.
+function Get-SupportedMids($sp) {
+    $b = Get-Bytes (Send-Obd $sp '0600' 3000) '4600'
+    if (-not $b) { return @() }
+    $mids = @()
+    for ($i = 0; $i -lt $b.Count; $i++) { for ($bit = 7; $bit -ge 0; $bit--) { if ($b[$i] -band (1 -shl $bit)) { $mids += ($i*8 + (8 - $bit)) } } }
+    $mids
+}
+function Get-Mode06Raw($sp, [int]$mid) {
+    # Raw hex payload for one MID (after the "46xx" echo). NOTE: deliberately not split into
+    # TID/UAS/value/min/max - per ISO 15031-5 each record's length varies with the UAS byte
+    # (some carry no limit, some one, some both), and a fixed-width guess would silently
+    # misalign and corrupt every record after the first one that doesn't match. Showing the
+    # verified raw bytes is more honest than a guessed decode.
+    Get-EcuPayload (Send-Obd $sp ("06{0:X2}" -f $mid) 4000) ("46{0:X2}" -f $mid)
+}
+function Show-Mode06($sp) {
+    Write-Host "On-board monitor test results (Mode 06) - raw payload per MID, read-only."
+    Write-Host "Record fields (TID/UAS/value/limits) are NOT decoded here - see the note in"
+    Write-Host "Get-Mode06Raw for why. Cross-reference against ISO 15031-5 Appendix B if you"
+    Write-Host "need the decoded fields.`n"
+    $mids = Get-SupportedMids $sp
+    if (-not $mids) { Write-Host "No Mode 06 data reported as supported by this vehicle."; return }
+    foreach ($mid in $mids) {
+        $p = Get-Mode06Raw $sp $mid
+        if ($p) { Write-Host ("MID 0x{0:X2}  raw: {1}" -f $mid, $p.Substring(4)) }
+    }
+}
+
+# ---------- vehicle profile: free public VIN decode (NHTSA vPIC API, no key needed) ----------
+function Get-VinInfo([string]$vin) {
+    try {
+        $resp = Invoke-RestMethod -Uri "https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/$vin`?format=json" -TimeoutSec 8
+        $row = $resp.Results[0]
+        [pscustomobject]@{ Year = $row.ModelYear; Make = $row.Make; Model = $row.Model; Engine = "$($row.EngineCylinders)cyl $($row.DisplacementL)L $($row.FuelTypePrimary)".Trim(); Error = $row.ErrorText }
+    } catch { $null }
+}
+
 # ---------- performance: 0-60, quarter mile, rough power estimate ----------
 function Start-Perf($sp) {
     $dSpd = $Pids | Where-Object { $_.P -eq '010D' }
@@ -245,34 +314,35 @@ function Show-Codes($sp, [string]$mode, [string]$label) {
     $r = Send-Obd $sp $mode 6000
     $hdr = '{0:X2}' -f ([Convert]::ToInt32($mode,16) + 0x40)
     $codes = @()
-    foreach ($line in ($r -split "[\r\n]+")) {
-        $h = ($line -replace '\s','').ToUpper()
-        if ($h.StartsWith($hdr)) {
-            $d = $h.Substring(2)
-            # skip count byte on CAN-style responses when length is odd in pairs
-            if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
-            for ($k = 0; $k + 3 -lt $d.Length; $k += 4) {
-                $hi = [Convert]::ToInt32($d.Substring($k,2),16); $lo = [Convert]::ToInt32($d.Substring($k+2,2),16)
-                if ($hi -ne 0 -or $lo -ne 0) { $codes += ConvertTo-Dtc $hi $lo }
-            }
+    $payload = Get-EcuPayload $r $hdr
+    if ($payload) {
+        $d = $payload.Substring(2)
+        # skip count byte on CAN-style responses when length is odd in pairs
+        if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
+        for ($k = 0; $k + 3 -lt $d.Length; $k += 4) {
+            $hi = [Convert]::ToInt32($d.Substring($k,2),16); $lo = [Convert]::ToInt32($d.Substring($k+2,2),16)
+            if ($hi -ne 0 -or $lo -ne 0) { $codes += ConvertTo-Dtc $hi $lo }
         }
     }
-    if ($r -match 'NO DATA' -or -not $codes) { Write-Host "${label}: none" }
+    if (-not $codes) { Write-Host "${label}: none" }
     else { Write-Host "${label}: $($codes -join ', ')" }
 }
 
 function Show-Info($sp) {
     Write-Host "Protocol: $(Send-Obd $sp 'ATDPN')"
     Write-Host "Adapter voltage: $(Send-Obd $sp 'ATRV')"
-    $vin = Send-Obd $sp '0902' 6000
-    $hex = ($vin -split "[\r\n]+" | ForEach-Object { ($_ -replace '\s','') -replace '^\d:','' }) -join ''
-    $i = $hex.IndexOf('4902')
-    if ($i -ge 0) {
-        $d = $hex.Substring($i + 4)
-        $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k,2),16); if ($n -ge 48 -and $n -le 90) { [char]$n } }
-        $v = -join $chars
-        if ($v.Length -ge 17) { Write-Host "VIN: $($v.Substring($v.Length-17))" } else { Write-Host "VIN: unavailable" }
-    } else { Write-Host "VIN: not supported by this vehicle" }
+    $payload = Get-EcuPayload (Send-Obd $sp '0902' 6000) '4902'
+    # payload = "4902" + 1-byte item count + 17 ASCII bytes (VIN) = 20 bytes = 40 hex chars
+    if ($payload -and $payload.Length -ge 40) {
+        $d = $payload.Substring(6)
+        $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k,2),16); if ($n -ge 32 -and $n -le 126) { [char]$n } else { '?' } }
+        $vin17 = (-join $chars).Substring(0, 17)
+        Write-Host "VIN: $vin17"
+        $info = Get-VinInfo $vin17
+        if ($info -and ($info.Make -or $info.Error -match '^0\b')) { Write-Host "Vehicle: $($info.Year) $($info.Make) $($info.Model) - $($info.Engine)" }
+        elseif ($info) { Write-Host "Vehicle profile lookup: $($info.Error)" }
+        else { Write-Host "Vehicle profile lookup failed (no internet, or NHTSA API unreachable)." }
+    } else { Write-Host "VIN: unavailable" }
     Show-Codes $sp '03' 'Stored codes'
 }
 
@@ -287,6 +357,7 @@ try {
         'Trims'      { Show-Trims $sp }
         'Freeze'     { Show-Freeze $sp }
         'Monitors'   { Show-Monitors $sp }
+        'Mode06'     { Show-Mode06 $sp }
         'Log'        { Start-Log $sp }
         'Perf'       { Start-Perf $sp }
         'ClearCodes' {
@@ -294,7 +365,7 @@ try {
         }
         'Menu' {
             while ($true) {
-                Write-Host "`nDIAGNOSE: 2) Codes  3) Info/VIN  4) Clear codes  5) Fuel trims  6) Freeze frame  7) Readiness"
+                Write-Host "`nDIAGNOSE: 2) Codes  3) Info/VIN  4) Clear codes  5) Fuel trims  6) Freeze frame  7) Readiness  10) Mode 06 monitor tests"
                 Write-Host "LOG/TUNE: 1) Live data  8) Datalog to CSV  9) 0-60 / 1/4 mile / hp estimate   Q) Quit"
                 switch ((Read-Host '>').ToUpper()) {
                     '5' { Show-Trims $sp }
@@ -302,6 +373,7 @@ try {
                     '7' { Show-Monitors $sp }
                     '8' { Start-Log $sp }
                     '9' { Start-Perf $sp }
+                    '10' { Show-Mode06 $sp }
                     '1' { Show-Live $sp }
                     '2' { Show-Codes $sp '03' 'Stored codes'; Show-Codes $sp '07' 'Pending codes' }
                     '3' { Show-Info $sp }
