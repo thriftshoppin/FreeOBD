@@ -16,7 +16,9 @@ What FreeOBD can do today is read and log the data a tuner needs: fuel trims, ti
 
 A non-flex-fuel engine on E85 needs roughly 30-40% more fuel than gasoline. The ECU's trim limit isn't enough, so expect lean codes and a check-engine light. Fixing it properly means a real tune plus hardware headroom (injector size, fuel pump, fuel system materials), and ideally an ethanol content sensor. E85 also has about 25-30% less energy per gallon, so it only saves money when it is much cheaper per gallon.
 
-## Planned
+## Planned / Implemented
 
-- Datalog analysis helpers (trim maps, lean/rich under load)
-- Integration notes for existing tuning tools
+- [x] Integration notes for existing open-source GM tools (see `gm/README.md`)
+- [x] PCM Hammer backup wrapper (`gm/gm-service.ps1 -Action HammerBackup`)
+- [ ] Datalog analysis helpers (trim maps, lean/rich under load)
+- [ ] Direct in-app flashing (not feasible with generic ELM327; use PCM Hammer)

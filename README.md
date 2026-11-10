@@ -6,15 +6,18 @@ A small, free, no-install OBD2 scanner for Windows. Pure PowerShell, no dependen
 
 ## Features
 
-- **GUI** (`obd2gui.ps1`): plain Windows window with tabs: Live data, Fuel trims, Codes, Log, Performance.
+- **GUI** (`obd2gui.ps1`): plain Windows window with tabs: Live data, Fuel trims, Codes, Log, Performance, Vehicle, Module Info, Misfire (GM).
 - **CLI** (`obd2scan.ps1`): menu and one-shot modes for scripting.
 - Live sensor data (RPM, speed, coolant, MAF, MAP, timing, throttle, fuel level, trims, lambda, voltage)
 - Read stored and pending trouble codes, with descriptions for common ones
 - Clear codes (with confirmation)
 - Fuel trim view with lean/rich hints
-- Freeze frame, readiness monitors, VIN (CLI)
+- Freeze frame, readiness monitors, VIN + vehicle profile + recalls
+- Mode 06 raw monitor results, Mode 09 module info (Cal ID, name, CVN)
+- GM Mode 22 per-cylinder misfire candidates (community-sourced)
 - CSV datalogging
 - 0-60 mph and quarter-mile timer (estimates)
+- **GM tools integration** (`gm/`): enhanced Mode 22 probes + PCM Hammer backup wrapper. See `gm/README.md`.
 
 ## Requirements
 
@@ -33,7 +36,9 @@ powershell -ExecutionPolicy Bypass -File obd2gui.ps1
 powershell -ExecutionPolicy Bypass -File obd2scan.ps1 -Port COM3 -Mode Codes
 ```
 
-CLI modes: `Menu` (default), `Live`, `Codes`, `Info`, `ClearCodes`, `Trims`, `Freeze`, `Monitors`, `Log`, `Perf`.
+CLI modes: `Menu` (default), `Live`, `Codes`, `Info`, `ClearCodes`, `Trims`, `Freeze`, `Monitors`, `Mode06`, `Mode09`, `GmMisfire`, `Recalls`, `Log`, `Perf`.
+
+GM enhanced tools: `powershell -ExecutionPolicy Bypass -File gm/gm-service.ps1 -Port COM3 -Action Misfire`
 
 `bt-pair.ps1 -Address <12 hex digits>` can pair a classic Bluetooth adapter from the command line by trying common PINs.
 
@@ -46,10 +51,11 @@ CLI modes: `Menu` (default), `Live`, `Codes`, `Info`, `ClearCodes`, `Trims`, `Fr
 
 ## Roadmap
 
-- [ ] Tuning support (see `docs/TUNING-NOTES.md`; flashing needs more than a generic ELM327)
-- [ ] Manufacturer-specific PIDs (GM Mode 22)
+- [x] Manufacturer-specific PIDs (GM Mode 22 misfire candidates + service probes)
+- [x] Integration notes and wrapper for PCM Hammer / UniversalPatcher (ECU backups & tuning)
 - [ ] Charts and log playback
 - [ ] Fuller trouble code database
+- [ ] Deeper PCM Hammer CLI automation once stable flags are documented
 
 ## Disclaimer
 
