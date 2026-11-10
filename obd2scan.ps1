@@ -8,7 +8,7 @@
 param(
     [string]$Port,
     [int]$Baud = 38400,
-    [ValidateSet('Menu','Live','Codes','Info','ClearCodes','Trims','Freeze','Monitors','Mode06','Log','Perf')][string]$Mode = 'Menu',
+    [ValidateSet('Menu','Live','Codes','Info','ClearCodes','Trims','Freeze','Monitors','Mode06','Mode09','GmMisfire','Recalls','Log','Perf')][string]$Mode = 'Menu',
     [string]$LogDir = (Join-Path $PSScriptRoot 'logs')
 )
 
@@ -16,6 +16,12 @@ param(
 # ---------- connection ----------
 function Send-Obd([System.IO.Ports.SerialPort]$sp, [string]$cmd, [int]$timeoutMs = 4000) {
     $sp.DiscardInBuffer()
+    # This cheap Bluetooth clone can still be flushing a previous response's trailing bytes
+    # into the OS buffer a few ms after we saw its '>' prompt and moved on. If we write the
+    # next command right then, those stragglers land mixed in with the new reply and corrupt
+    # the frame reassembly. A short settle + second drain clears them out first.
+    Start-Sleep -Milliseconds 20
+    if ($sp.BytesToRead -gt 0) { try { [void]$sp.ReadExisting() } catch {}; $sp.DiscardInBuffer() }
     $sp.Write("$cmd`r")
     $buf = ''
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -28,12 +34,12 @@ function Send-Obd([System.IO.Ports.SerialPort]$sp, [string]$cmd, [int]$timeoutMs
     ($buf -replace '>', '').Trim()
 }
 
-function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+function Get-EcuBuckets([string]$resp) {
     # CAN cars often have several modules answer the same request at once (normal, not an
     # error). With headers on (ATH1) every line is tagged with its 3-char source CAN ID, so we
-    # bucket lines by that header, reassemble each bucket's own ISO-TP payload (single frame or
-    # first+consecutive frames), and return whichever bucket's payload actually starts with the
-    # response we asked for. This is what stops one module's reply from corrupting another's.
+    # bucket lines by that header and reassemble each bucket's own ISO-TP payload (single frame
+    # or first+consecutive frames). Returns an ordered header -> payload-hex map. This is what
+    # stops one module's reply from corrupting another's.
     $buckets = [ordered]@{}
     foreach ($line in ($resp -split "[\r\n]+")) {
         $h = ($line -replace '[^0-9A-Fa-f]', '').ToUpper()
@@ -42,6 +48,7 @@ function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
         if (-not $buckets.Contains($hdr)) { $buckets[$hdr] = New-Object System.Collections.Generic.List[string] }
         $buckets[$hdr].Add($rest)
     }
+    $out = [ordered]@{}
     foreach ($hdr in $buckets.Keys) {
         $frames = $buckets[$hdr]; $f0 = $frames[0]
         if ($f0.Length -lt 2) { continue }
@@ -59,9 +66,22 @@ function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
             }
             if (($acc.Length / 2) -ge $len) { $payload = $acc.Substring(0, $len * 2) }
         }
-        if ($payload -and $payload.StartsWith($expectPrefix.ToUpper())) { return $payload }
+        if ($payload) { $out[$hdr] = $payload }
     }
+    $out
+}
+function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+    # First module whose payload starts with $expectPrefix (most callers only want one answer).
+    foreach ($kv in (Get-EcuBuckets $resp).GetEnumerator()) { if ($kv.Value.StartsWith($expectPrefix.ToUpper())) { return $kv.Value } }
     $null
+}
+function Get-AllEcuPayloads([string]$resp, [string]$expectPrefix) {
+    # Every module whose payload starts with $expectPrefix, as an ordered header -> payload map.
+    # GM cars commonly have 2-3+ modules answer the same generic request (engine plus others);
+    # this is what lets a scan show codes from all of them instead of just whichever answers first.
+    $out = [ordered]@{}
+    foreach ($kv in (Get-EcuBuckets $resp).GetEnumerator()) { if ($kv.Value.StartsWith($expectPrefix.ToUpper())) { $out[$kv.Key] = $kv.Value } }
+    $out
 }
 
 function Get-Bytes([string]$resp, [string]$expectPrefix) {
@@ -117,7 +137,17 @@ $Pids = @(
     @{ P='015E'; N='Fuel rate';        U='L/h';  F={ param($a) [math]::Round((256*$a[0]+$a[1])/20,2) } },
     @{ P='0111'; N='Throttle';         U='%';    F={ param($a) [math]::Round($a[0]*100/255,1) } },
     @{ P='012F'; N='Fuel level';       U='%';    F={ param($a) [math]::Round($a[0]*100/255,1) } },
-    @{ P='0142'; N='Control module V'; U='V';    F={ param($a) [math]::Round((256*$a[0]+$a[1])/1000,2) } }
+    @{ P='0142'; N='Control module V'; U='V';    F={ param($a) [math]::Round((256*$a[0]+$a[1])/1000,2) } },
+    @{ P='010A'; N='Fuel pressure';    U='kPa';  F={ param($a) $a[0]*3 } },
+    @{ P='011F'; N='Run time since start'; U='s'; F={ param($a) (256*$a[0]+$a[1]) } },
+    @{ P='0121'; N='Distance w/ MIL on'; U='km'; F={ param($a) (256*$a[0]+$a[1]) } },
+    @{ P='0131'; N='Distance since codes cleared'; U='km'; F={ param($a) (256*$a[0]+$a[1]) } },
+    @{ P='012E'; N='Commanded EVAP purge'; U='%'; F={ param($a) [math]::Round($a[0]*100/255,1) } },
+    @{ P='0143'; N='Absolute load';    U='%';    F={ param($a) [math]::Round((256*$a[0]+$a[1])*100/255,1) } },
+    @{ P='0145'; N='Relative throttle'; U='%';   F={ param($a) [math]::Round($a[0]*100/255,1) } },
+    @{ P='0146'; N='Ambient air temp'; U='C';    F={ param($a) $a[0]-40 } },
+    @{ P='014C'; N='Cmd throttle actuator'; U='%'; F={ param($a) [math]::Round($a[0]*100/255,1) } },
+    @{ P='015C'; N='Engine oil temp';  U='C';    F={ param($a) $a[0]-40 } }
 )
 
 function Read-Pid($sp, $def) {
@@ -264,6 +294,74 @@ function Get-VinInfo([string]$vin) {
     } catch { $null }
 }
 
+# ---------- NHTSA recalls (free public API, no vehicle communication - just make/model/year) ----------
+function Show-Recalls([string]$make, [string]$model, [string]$year) {
+    try {
+        $resp = Invoke-RestMethod -Uri "https://api.nhtsa.gov/recalls/recallsByVehicle?make=$make&model=$model&modelYear=$year" -TimeoutSec 8
+        $items = $resp.results
+        if (-not $items -or $items.Count -eq 0) { Write-Host "Recalls: none on file for $year $make $model."; return }
+        Write-Host "Recalls: $($items.Count) on file for $year $make $model -"
+        foreach ($i in $items) { Write-Host ("  [$($i.NHTSACampaignNumber)] $($i.Component): $($i.Summary)") }
+    } catch { Write-Host "Recalls lookup failed (no internet, or NHTSA API unreachable)." }
+}
+
+# ---------- Mode 09 extras: Calibration ID, CVN, ECU name (same read-only family as VIN) ----------
+# Shown per-module (like Show-Codes) rather than just the first answer - on a car with several
+# modules on the bus, each one has its own calibration/CVN/name, and the name often reveals
+# what that module actually is (e.g. a fuel pump controller), which is useful info on its own.
+function Show-Mode09Extra($sp) {
+    foreach ($x in @(@('04','Calibration ID'), @('0A','ECU name'))) {
+        $any = $false
+        foreach ($kv in (Get-AllEcuPayloads (Send-Obd $sp "09$($x[0])" 6000) "49$($x[0])").GetEnumerator()) {
+            $d = $kv.Value.Substring(6)
+            $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k,2),16); if ($n -ge 32 -and $n -le 126) { [char]$n } }
+            $txt = (-join $chars).Trim()
+            $any = $true
+            Write-Host "$($x[1]) [module 0x$($kv.Key)]: $(if ($txt) { $txt } else { '(not printable - raw: ' + $d + ')' })"
+        }
+        if (-not $any) { Write-Host "$($x[1]): not supported by any responding module" }
+    }
+    $any = $false
+    foreach ($kv in (Get-AllEcuPayloads (Send-Obd $sp '0906' 6000) '4906').GetEnumerator()) {
+        $any = $true
+        Write-Host "CVN [module 0x$($kv.Key)]: 0x$($kv.Value.Substring(6,8)) - matches GM's published value only if that module is still running its original stock calibration"
+    }
+    if (-not $any) { Write-Host "CVN: not supported by any responding module" }
+}
+
+# ---------- GM Mode 22 per-cylinder misfire counts ----------
+# PIDs below are community-sourced (GM Nation / Torque app PID lists), NOT independently
+# verified against GM's own documentation, and at least one forum thread flags cylinders 1/2
+# as possibly swapped on some platforms. We read them from the real car and show the raw
+# result - you decide whether the numbers look plausible (near zero, rising only when you
+# know you have a misfire) rather than trusting the PID table blindly.
+function Show-GmMisfire($sp) {
+    Write-Host "GM enhanced (Mode 22) per-cylinder misfire counts - UNVERIFIED PID mapping, cross-check"
+    Write-Host "against real driving behavior before trusting which number belongs to which cylinder.`n"
+    $gotAny = $false
+    for ($cyl = 1; $cyl -le 8; $cyl++) {
+        $pidByte = '{0:X2}' -f (0x04 + $cyl)   # candidate pattern per forum source: 1205=cyl1, 1206=cyl2
+        $req = "2212$pidByte"
+        $raw = Send-Obd $sp $req 3000
+        $payload = Get-EcuPayload $raw "6212$pidByte"
+        if ($payload -and $payload.Length -gt 6) {
+            $gotAny = $true
+            $rem = $payload.Substring(6)
+            $v = [Convert]::ToInt32($rem.Substring(0, [Math]::Min(4, $rem.Length)), 16)
+            Write-Host ("Cylinder $cyl candidate (PID 22 12$pidByte): $v")
+        } elseif ($raw -match '7F22(\w\w)') {
+            $nrc = $Matches[1]
+            $why = switch ($nrc) { '12' { 'sub-function (PID) not supported' } '31' { 'request out of range' } '11' { 'service not supported' } default { "NRC 0x$nrc" } }
+            Write-Host ("Cylinder $cyl candidate (PID 22 12$pidByte): rejected by ECU - $why")
+        }
+    }
+    if (-not $gotAny) {
+        Write-Host "`nNo module on this car recognizes this candidate PID range (0x1205-0x120C)."
+        Write-Host "This forum-sourced mapping does not apply to your ECM/calibration - rather than"
+        Write-Host "report fabricated numbers, this feature is honestly reporting: not available this way."
+    }
+}
+
 # ---------- performance: 0-60, quarter mile, rough power estimate ----------
 function Start-Perf($sp) {
     $dSpd = $Pids | Where-Object { $_.P -eq '010D' }
@@ -311,21 +409,21 @@ function ConvertTo-Dtc([int]$hi, [int]$lo) {
 }
 
 function Show-Codes($sp, [string]$mode, [string]$label) {
+    # Reads from EVERY module that answers (engine plus whatever else is at 7EA/7EB on your
+    # car), not just the first - this is the "all modules" scan a dealer-grade tool does.
     $r = Send-Obd $sp $mode 6000
     $hdr = '{0:X2}' -f ([Convert]::ToInt32($mode,16) + 0x40)
-    $codes = @()
-    $payload = Get-EcuPayload $r $hdr
-    if ($payload) {
-        $d = $payload.Substring(2)
-        # skip count byte on CAN-style responses when length is odd in pairs
-        if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
+    $any = $false
+    foreach ($kv in (Get-AllEcuPayloads $r $hdr).GetEnumerator()) {
+        $codes = @(); $d = $kv.Value.Substring(2)
+        if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }   # skip count byte some ECUs prepend
         for ($k = 0; $k + 3 -lt $d.Length; $k += 4) {
             $hi = [Convert]::ToInt32($d.Substring($k,2),16); $lo = [Convert]::ToInt32($d.Substring($k+2,2),16)
             if ($hi -ne 0 -or $lo -ne 0) { $codes += ConvertTo-Dtc $hi $lo }
         }
+        if ($codes) { $any = $true; Write-Host ("${label} [module 0x$($kv.Key)]: $($codes -join ', ')") }
     }
-    if (-not $codes) { Write-Host "${label}: none" }
-    else { Write-Host "${label}: $($codes -join ', ')" }
+    if (-not $any) { Write-Host "${label}: none (from any responding module)" }
 }
 
 function Show-Info($sp) {
@@ -339,11 +437,15 @@ function Show-Info($sp) {
         $vin17 = (-join $chars).Substring(0, 17)
         Write-Host "VIN: $vin17"
         $info = Get-VinInfo $vin17
-        if ($info -and ($info.Make -or $info.Error -match '^0\b')) { Write-Host "Vehicle: $($info.Year) $($info.Make) $($info.Model) - $($info.Engine)" }
+        if ($info -and ($info.Make -or $info.Error -match '^0\b')) {
+            Write-Host "Vehicle: $($info.Year) $($info.Make) $($info.Model) - $($info.Engine)"
+            Show-Recalls $info.Make $info.Model $info.Year
+        }
         elseif ($info) { Write-Host "Vehicle profile lookup: $($info.Error)" }
         else { Write-Host "Vehicle profile lookup failed (no internet, or NHTSA API unreachable)." }
     } else { Write-Host "VIN: unavailable" }
     Show-Codes $sp '03' 'Stored codes'
+    Show-Codes $sp '0A' 'Permanent codes'
 }
 
 # ---------- main ----------
@@ -358,6 +460,19 @@ try {
         'Freeze'     { Show-Freeze $sp }
         'Monitors'   { Show-Monitors $sp }
         'Mode06'     { Show-Mode06 $sp }
+        'Mode09'     { Show-Mode09Extra $sp }
+        'GmMisfire'  { Show-GmMisfire $sp }
+        'Recalls'    {
+            $payload = Get-EcuPayload (Send-Obd $sp '0902' 6000) '4902'
+            if ($payload -and $payload.Length -ge 40) {
+                $d = $payload.Substring(6)
+                $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k,2),16); if ($n -ge 32 -and $n -le 126) { [char]$n } else { '?' } }
+                $vin17 = (-join $chars).Substring(0, 17)
+                $info = Get-VinInfo $vin17
+                if ($info -and ($info.Make -or $info.Error -match '^0\b')) { Show-Recalls $info.Make $info.Model $info.Year }
+                else { Write-Host "Couldn't decode a vehicle profile for this VIN; can't look up recalls." }
+            } else { Write-Host "VIN unavailable; can't look up recalls." }
+        }
         'Log'        { Start-Log $sp }
         'Perf'       { Start-Perf $sp }
         'ClearCodes' {
@@ -365,7 +480,8 @@ try {
         }
         'Menu' {
             while ($true) {
-                Write-Host "`nDIAGNOSE: 2) Codes  3) Info/VIN  4) Clear codes  5) Fuel trims  6) Freeze frame  7) Readiness  10) Mode 06 monitor tests"
+                Write-Host "`nDIAGNOSE: 2) Codes (all modules)  3) Info/VIN/recalls  4) Clear codes  5) Fuel trims  6) Freeze frame"
+                Write-Host "          7) Readiness  10) Mode 06 raw  11) Mode 09 extra (cal ID/CVN)  12) GM misfire (unverified)"
                 Write-Host "LOG/TUNE: 1) Live data  8) Datalog to CSV  9) 0-60 / 1/4 mile / hp estimate   Q) Quit"
                 switch ((Read-Host '>').ToUpper()) {
                     '5' { Show-Trims $sp }
@@ -374,6 +490,8 @@ try {
                     '8' { Start-Log $sp }
                     '9' { Start-Perf $sp }
                     '10' { Show-Mode06 $sp }
+                    '11' { Show-Mode09Extra $sp }
+                    '12' { Show-GmMisfire $sp }
                     '1' { Show-Live $sp }
                     '2' { Show-Codes $sp '03' 'Stored codes'; Show-Codes $sp '07' 'Pending codes' }
                     '3' { Show-Info $sp }

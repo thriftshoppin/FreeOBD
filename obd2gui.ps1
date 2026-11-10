@@ -8,7 +8,15 @@ $LogDir = Join-Path $PSScriptRoot 'logs'
 
 # ---------- core ----------
 function Send-Obd([string]$cmd, [int]$to = 3000) {
-    $sp = $script:sp; $sp.DiscardInBuffer(); $sp.Write("$cmd`r")
+    $sp = $script:sp
+    $sp.DiscardInBuffer()
+    # This cheap Bluetooth clone can still be flushing a previous response's trailing bytes
+    # into the OS buffer a few ms after we saw its '>' prompt and moved on. If we write the
+    # next command right then, those stragglers land mixed in with the new reply and corrupt
+    # the frame reassembly. A short settle + second drain clears them out first.
+    Start-Sleep -Milliseconds 20
+    if ($sp.BytesToRead -gt 0) { try { [void]$sp.ReadExisting() } catch {}; $sp.DiscardInBuffer() }
+    $sp.Write("$cmd`r")
     $buf = ''; $sw = [Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $to) {
         if ($sp.BytesToRead -gt 0) { $buf += $sp.ReadExisting(); if ($buf.Contains('>')) { break } }
@@ -16,12 +24,12 @@ function Send-Obd([string]$cmd, [int]$to = 3000) {
     }
     ($buf -replace '>', '').Trim()
 }
-function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+function Get-EcuBuckets([string]$resp) {
     # CAN cars often have several modules answer the same request at once (normal, not an
     # error). With headers on (ATH1) every line is tagged with its 3-char source CAN ID, so we
-    # bucket lines by that header, reassemble each bucket's own ISO-TP payload (single frame or
-    # first+consecutive frames), and return whichever bucket's payload actually starts with the
-    # response we asked for. This is what stops one module's reply from corrupting another's.
+    # bucket lines by that header and reassemble each bucket's own ISO-TP payload (single frame
+    # or first+consecutive frames) independently. This is what stops one module's reply from
+    # corrupting another's, and lets us show results per-module instead of just the first one.
     $buckets = [ordered]@{}
     foreach ($line in ($resp -split "[\r\n]+")) {
         $h = ($line -replace '[^0-9A-Fa-f]', '').ToUpper()
@@ -30,6 +38,7 @@ function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
         if (-not $buckets.Contains($hdr)) { $buckets[$hdr] = New-Object System.Collections.Generic.List[string] }
         $buckets[$hdr].Add($rest)
     }
+    $out = [ordered]@{}
     foreach ($hdr in $buckets.Keys) {
         $frames = $buckets[$hdr]; $f0 = $frames[0]
         if ($f0.Length -lt 2) { continue }
@@ -47,9 +56,18 @@ function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
             }
             if (($acc.Length / 2) -ge $len) { $payload = $acc.Substring(0, $len * 2) }
         }
-        if ($payload -and $payload.StartsWith($expectPrefix.ToUpper())) { return $payload }
+        if ($payload) { $out[$hdr] = $payload }
     }
+    $out
+}
+function Get-EcuPayload([string]$resp, [string]$expectPrefix) {
+    foreach ($kv in (Get-EcuBuckets $resp).GetEnumerator()) { if ($kv.Value.StartsWith($expectPrefix.ToUpper())) { return $kv.Value } }
     $null
+}
+function Get-AllEcuPayloads([string]$resp, [string]$expectPrefix) {
+    $out = [ordered]@{}
+    foreach ($kv in (Get-EcuBuckets $resp).GetEnumerator()) { if ($kv.Value.StartsWith($expectPrefix.ToUpper())) { $out[$kv.Key] = $kv.Value } }
+    $out
 }
 function Get-Bytes([string]$resp, [string]$prefix) {
     $payload = Get-EcuPayload $resp $prefix
@@ -76,7 +94,17 @@ $Pids = @(
  @{P='0111';N='Throttle';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
  @{P='012F';N='Fuel level';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
  @{P='015E';N='Fuel rate';U='L/h';F={param($a)[math]::Round((256*$a[0]+$a[1])/20,2)}},
- @{P='0142';N='Module voltage';U='V';F={param($a)[math]::Round((256*$a[0]+$a[1])/1000,2)}}
+ @{P='0142';N='Module voltage';U='V';F={param($a)[math]::Round((256*$a[0]+$a[1])/1000,2)}},
+ @{P='010A';N='Fuel pressure';U='kPa';F={param($a)$a[0]*3}},
+ @{P='011F';N='Run time since start';U='s';F={param($a)256*$a[0]+$a[1]}},
+ @{P='0121';N='Distance w/ MIL on';U='km';F={param($a)256*$a[0]+$a[1]}},
+ @{P='0131';N='Distance since codes cleared';U='km';F={param($a)256*$a[0]+$a[1]}},
+ @{P='012E';N='EVAP purge %';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='0143';N='Absolute load';U='%';F={param($a)[math]::Round((256*$a[0]+$a[1])*100/255,1)}},
+ @{P='0145';N='Relative throttle';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='0146';N='Ambient air temp';U='C';F={param($a)$a[0]-40}},
+ @{P='014C';N='Cmd throttle actuator';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='015C';N='Oil temp';U='C';F={param($a)$a[0]-40}}
 )
 function Read-Pid($d) { $b = Get-Bytes (Send-Obd $d.P 1500) ('41' + $d.P.Substring(2)); if ($null -eq $b) { $null } else { & $d.F $b } }
 
@@ -110,6 +138,54 @@ function Get-VinInfo([string]$vin) {
         [pscustomobject]@{ Year = $row.ModelYear; Make = $row.Make; Model = $row.Model; Engine = "$($row.EngineCylinders)cyl $($row.DisplacementL)L $($row.FuelTypePrimary)".Trim(); Error = $row.ErrorText }
     } catch { $null }
 }
+function Get-Recalls([string]$make, [string]$model, [string]$year) {
+    try {
+        $resp = Invoke-RestMethod -Uri "https://api.nhtsa.gov/recalls/recallsByVehicle?make=$make&model=$model&modelYear=$year" -TimeoutSec 8
+        ,@($resp.results)
+    } catch { ,@() }
+}
+# Mode 09 extras (Calibration ID, ECU name, CVN) - same read-only family as VIN, shown per
+# module since each module has its own, and the name often reveals what that module actually is.
+function Get-Mode09Extra($sp) {
+    $rows = [ordered]@{}
+    foreach ($x in @(@('04','CalId'), @('0A','Name'))) {
+        foreach ($kv in (Get-AllEcuPayloads (Send-Obd "09$($x[0])" 6000) "49$($x[0])").GetEnumerator()) {
+            $d = $kv.Value.Substring(6)
+            $chars = for ($k = 0; $k + 1 -lt $d.Length; $k += 2) { $n = [Convert]::ToInt32($d.Substring($k,2),16); if ($n -ge 32 -and $n -le 126) { [char]$n } }
+            $txt = (-join $chars).Trim(); if (-not $txt) { $txt = "(raw: $d)" }
+            if (-not $rows.Contains($kv.Key)) { $rows[$kv.Key] = @{ CalId = ''; Name = ''; Cvn = '' } }
+            $rows[$kv.Key][$x[1]] = $txt
+        }
+    }
+    foreach ($kv in (Get-AllEcuPayloads (Send-Obd '0906' 6000) '4906').GetEnumerator()) {
+        if (-not $rows.Contains($kv.Key)) { $rows[$kv.Key] = @{ CalId = ''; Name = ''; Cvn = '' } }
+        $rows[$kv.Key]['Cvn'] = "0x$($kv.Value.Substring(6,8))"
+    }
+    $rows
+}
+# GM enhanced Mode 22 per-cylinder misfire counts - community-sourced candidate PIDs (GM
+# Nation / Torque app lists), NOT verified against GM's own documentation. Reports the ECU's
+# actual response (value or rejection reason) rather than guessing numbers.
+function Get-GmMisfire($sp) {
+    $out = @()
+    for ($cyl = 1; $cyl -le 8; $cyl++) {
+        $pidByte = '{0:X2}' -f (0x04 + $cyl)
+        $raw = Send-Obd "2212$pidByte" 3000
+        $payload = Get-EcuPayload $raw "6212$pidByte"
+        if ($payload -and $payload.Length -gt 6) {
+            $rem = $payload.Substring(6)
+            $v = [Convert]::ToInt32($rem.Substring(0, [Math]::Min(4, $rem.Length)), 16)
+            $out += [pscustomobject]@{ Cyl = $cyl; Pid = "22 12$pidByte"; Result = "$v" }
+        } elseif ($raw -match '7F22(\w\w)') {
+            $nrc = $Matches[1]
+            $why = switch ($nrc) { '12' { 'sub-function (PID) not supported' } '31' { 'request out of range' } '11' { 'service not supported' } default { "NRC 0x$nrc" } }
+            $out += [pscustomobject]@{ Cyl = $cyl; Pid = "22 12$pidByte"; Result = "rejected - $why" }
+        } else {
+            $out += [pscustomobject]@{ Cyl = $cyl; Pid = "22 12$pidByte"; Result = '(no response)' }
+        }
+    }
+    $out
+}
 function ConvertTo-Dtc([int]$hi, [int]$lo) { '{0}{1}{2:X}{3:X2}' -f ('P','C','B','U')[($hi -shr 6) -band 3], (($hi -shr 4) -band 3), ($hi -band 15), $lo }
 function Describe-Dtc([string]$c) {
     $map = @{ P0171='System too lean, bank 1'; P0174='System too lean, bank 2'; P0172='System too rich, bank 1'; P0175='System too rich, bank 2';
@@ -131,7 +207,7 @@ $bc = New-Object Windows.Forms.Button; $bc.Text = 'Connect'; $bc.Location = '148
 $st = New-Object Windows.Forms.Label; $st.Text = 'Not connected'; $st.Location = '250,12'; $st.AutoSize = $true
 $top.Controls.AddRange(@($lp, $cb, $bc, $st))
 $tabs = New-Object Windows.Forms.TabControl; $tabs.Dock = 'Fill'
-foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance','Vehicle') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
+foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance','Vehicle','Module Info','Misfire (GM)') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
 $f.Controls.Add($tabs); $f.Controls.Add($top)
 $tabs.BringToFront()
 
@@ -156,7 +232,7 @@ $tabs.TabPages[1].Controls.Add($note)
 
 # Codes
 $lc = New-Object Windows.Forms.ListView; $lc.View = 'Details'; $lc.Location = '10,45'; $lc.Size = '670,380'; $lc.FullRowSelect = $true; $lc.GridLines = $true
-[void]$lc.Columns.Add('Code', 90); [void]$lc.Columns.Add('Type', 90); [void]$lc.Columns.Add('Description', 470)
+[void]$lc.Columns.Add('Code', 90); [void]$lc.Columns.Add('Type', 140); [void]$lc.Columns.Add('Description', 420)
 $br = New-Object Windows.Forms.Button; $br.Text = 'Read codes'; $br.Location = '10,10'; $br.Width = 110
 $bx = New-Object Windows.Forms.Button; $bx.Text = 'Clear codes'; $bx.Location = '130,10'; $bx.Width = 110
 $tabs.TabPages[2].Controls.AddRange(@($br, $bx, $lc))
@@ -172,13 +248,27 @@ $pl = New-Object Windows.Forms.Label; $pl.Location = '10,50'; $pl.Size = '670,20
 $pl.Text = 'Press Arm run, come to a stop on a closed course, then launch. Q-mile and 0-60 times are estimates (Bluetooth is slow).'
 $tabs.TabPages[4].Controls.AddRange(@($bp, $pl))
 
-# Vehicle (VIN profile + Mode 06 monitor tests)
+# Vehicle (VIN profile + recalls + Mode 06 monitor tests)
 $bvin = New-Object Windows.Forms.Button; $bvin.Text = 'Identify vehicle (VIN)'; $bvin.Location = '10,10'; $bvin.Width = 170
-$lvin = New-Object Windows.Forms.Label; $lvin.Location = '10,45'; $lvin.Size = '670,45'; $lvin.Text = 'Not identified yet.'
-$bm6 = New-Object Windows.Forms.Button; $bm6.Text = 'Read monitor tests (Mode 06)'; $bm6.Location = '10,100'; $bm6.Width = 210
-$lm6 = New-Object Windows.Forms.ListView; $lm6.View = 'Details'; $lm6.Location = '10,135'; $lm6.Size = '670,300'; $lm6.FullRowSelect = $true; $lm6.GridLines = $true
+$lvin = New-Object Windows.Forms.Label; $lvin.Location = '10,45'; $lvin.Size = '670,70'; $lvin.Text = 'Not identified yet.'
+$bm6 = New-Object Windows.Forms.Button; $bm6.Text = 'Read monitor tests (Mode 06)'; $bm6.Location = '10,120'; $bm6.Width = 210
+$lm6 = New-Object Windows.Forms.ListView; $lm6.View = 'Details'; $lm6.Location = '10,155'; $lm6.Size = '670,280'; $lm6.FullRowSelect = $true; $lm6.GridLines = $true
 [void]$lm6.Columns.Add('MID', 55); [void]$lm6.Columns.Add('Raw payload (not decoded - see tooltip/README)', 600)
 $tabs.TabPages[5].Controls.AddRange(@($bvin, $lvin, $bm6, $lm6))
+
+# Module Info (Mode 09: Calibration ID, ECU name, CVN - per responding module)
+$bmi = New-Object Windows.Forms.Button; $bmi.Text = 'Read module info (Mode 09)'; $bmi.Location = '10,10'; $bmi.Width = 200
+$lmi = New-Object Windows.Forms.ListView; $lmi.View = 'Details'; $lmi.Location = '10,45'; $lmi.Size = '670,390'; $lmi.FullRowSelect = $true; $lmi.GridLines = $true
+[void]$lmi.Columns.Add('Module', 70); [void]$lmi.Columns.Add('ECU name', 150); [void]$lmi.Columns.Add('Calibration ID', 220); [void]$lmi.Columns.Add('CVN', 100)
+$tabs.TabPages[6].Controls.AddRange(@($bmi, $lmi))
+
+# Misfire (GM) - unverified Mode 22 candidate PIDs, honest pass/reject reporting
+$bmf = New-Object Windows.Forms.Button; $bmf.Text = 'Read misfire counters (GM)'; $bmf.Location = '10,10'; $bmf.Width = 200
+$lmfNote = New-Object Windows.Forms.Label; $lmfNote.Location = '10,45'; $lmfNote.Size = '670,45'
+$lmfNote.Text = "Community-sourced candidate PIDs, NOT verified against GM documentation. Shows the ECU's`r`nactual response (value or rejection reason) rather than guessed numbers."
+$lmf = New-Object Windows.Forms.ListView; $lmf.View = 'Details'; $lmf.Location = '10,95'; $lmf.Size = '670,340'; $lmf.FullRowSelect = $true; $lmf.GridLines = $true
+[void]$lmf.Columns.Add('Cylinder', 70); [void]$lmf.Columns.Add('PID', 90); [void]$lmf.Columns.Add('Result', 480)
+$tabs.TabPages[7].Controls.AddRange(@($bmf, $lmfNote, $lmf))
 
 # ---------- behavior ----------
 function Set-Status([string]$m) { $st.Text = $m }
@@ -208,13 +298,12 @@ $bc.Add_Click({
 $br.Add_Click({
     if (-not $script:sp) { Set-Status 'Connect first.'; return }
     $timer.Stop(); $lc.Items.Clear()
-    foreach ($m in @(@('03','Stored'), @('07','Pending'))) {
+    foreach ($m in @(@('03','Stored'), @('07','Pending'), @('0A','Permanent'))) {
         $hdr = '{0:X2}' -f ([Convert]::ToInt32($m[0], 16) + 0x40)
-        $payload = Get-EcuPayload (Send-Obd $m[0] 5000) $hdr
-        if ($payload) {
-            $d = $payload.Substring(2); if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
+        foreach ($kv in (Get-AllEcuPayloads (Send-Obd $m[0] 5000) $hdr).GetEnumerator()) {
+            $d = $kv.Value.Substring(2); if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
             for ($k = 0; $k + 3 -lt $d.Length; $k += 4) { $hi = [Convert]::ToInt32($d.Substring($k, 2), 16); $lo = [Convert]::ToInt32($d.Substring($k + 2, 2), 16)
-                if ($hi -or $lo) { $c = ConvertTo-Dtc $hi $lo; $it = $lc.Items.Add($c); [void]$it.SubItems.Add($m[1]); [void]$it.SubItems.Add((Describe-Dtc $c)) } }
+                if ($hi -or $lo) { $c = ConvertTo-Dtc $hi $lo; $it = $lc.Items.Add($c); [void]$it.SubItems.Add("$($m[1]) [0x$($kv.Key)]"); [void]$it.SubItems.Add((Describe-Dtc $c)) } }
         }
     }
     if ($lc.Items.Count -eq 0) { [void]$lc.Items.Add('(none)') }
@@ -247,10 +336,38 @@ $bvin.Add_Click({
     if (-not $vin) { $lvin.Text = 'VIN not available from this vehicle.'; $timer.Start(); return }
     $lvin.Text = "VIN: $vin`r`nLooking up vehicle profile..."; $f.Refresh()
     $info = Get-VinInfo $vin
-    if ($info -and ($info.Make -or $info.Error -match '^0\b')) { $lvin.Text = "VIN: $vin`r`n$($info.Year) $($info.Make) $($info.Model) - $($info.Engine)" }
+    if ($info -and ($info.Make -or $info.Error -match '^0\b')) {
+        $lvin.Text = "VIN: $vin`r`n$($info.Year) $($info.Make) $($info.Model) - $($info.Engine)`r`nLooking up recalls..."
+        $f.Refresh()
+        $recalls = Get-Recalls $info.Make $info.Model $info.Year
+        if ($recalls.Count -gt 0) {
+            $names = ($recalls | ForEach-Object { $_.Component } | Select-Object -Unique) -join '; '
+            $lvin.Text = "VIN: $vin`r`n$($info.Year) $($info.Make) $($info.Model) - $($info.Engine)`r`n$($recalls.Count) open NHTSA recall(s): $names"
+        } else {
+            $lvin.Text = "VIN: $vin`r`n$($info.Year) $($info.Make) $($info.Model) - $($info.Engine)`r`nNo open NHTSA recalls found."
+        }
+    }
     elseif ($info) { $lvin.Text = "VIN: $vin`r`nLookup: $($info.Error)" }
     else { $lvin.Text = "VIN: $vin`r`n(no internet, or NHTSA API unreachable)" }
     $timer.Start()
+})
+$bmi.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $timer.Stop(); $lmi.Items.Clear(); Set-Status 'Reading module info (Mode 09)...'; $f.Refresh()
+    foreach ($kv in (Get-Mode09Extra $script:sp).GetEnumerator()) {
+        $it = $lmi.Items.Add("0x$($kv.Key)")
+        [void]$it.SubItems.Add($(if ($kv.Value.Name) { $kv.Value.Name } else { '--' }))
+        [void]$it.SubItems.Add($(if ($kv.Value.CalId) { $kv.Value.CalId } else { '--' }))
+        [void]$it.SubItems.Add($(if ($kv.Value.Cvn) { $kv.Value.Cvn } else { '--' }))
+    }
+    if ($lmi.Items.Count -eq 0) { [void]$lmi.Items.Add('(no module responded)') }
+    Set-Status 'Module info read.'; $timer.Start()
+})
+$bmf.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $timer.Stop(); $lmf.Items.Clear(); Set-Status 'Reading GM misfire candidates...'; $f.Refresh()
+    foreach ($row in (Get-GmMisfire $script:sp)) { $it = $lmf.Items.Add("$($row.Cyl)"); [void]$it.SubItems.Add($row.Pid); [void]$it.SubItems.Add($row.Result) }
+    Set-Status 'Done.'; $timer.Start()
 })
 $bm6.Add_Click({
     if (-not $script:sp) { Set-Status 'Connect first.'; return }
