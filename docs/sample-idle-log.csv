@@ -1,0 +1,2 @@
+time_s,Engine load [%],Coolant temp [C],RPM [rpm],Speed [km/h],Intake air temp [C],MAF [g/s],STFT bank1 [%],LTFT bank1 [%],STFT bank2 [%],LTFT bank2 [%],Timing advance [deg],Baro [kPa],Cmd lambda [],Throttle [%],Fuel level [%],Control module V [V]
+0,30.2,59,674,0,34,4.72,-4.7,19.5,-3.9,25.8,7.5,96,1,20.8,25.9,14.21

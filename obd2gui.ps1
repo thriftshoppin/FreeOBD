@@ -1,0 +1,208 @@
+# Simple OBD2 scanner window for ELM327 adapters. Run: powershell -ExecutionPolicy Bypass -File obd2gui.ps1
+Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$script:sp = $null; $script:sup = @(); $script:i = 0; $script:vals = @{}
+$script:logW = $null; $script:perf = $null
+$LogDir = Join-Path $PSScriptRoot 'logs'
+
+# ---------- core ----------
+function Send-Obd([string]$cmd, [int]$to = 3000) {
+    $sp = $script:sp; $sp.DiscardInBuffer(); $sp.Write("$cmd`r")
+    $buf = ''; $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $to) {
+        if ($sp.BytesToRead -gt 0) { $buf += $sp.ReadExisting(); if ($buf.Contains('>')) { break } }
+        else { Start-Sleep -Milliseconds 10 }
+    }
+    ($buf -replace '>', '').Trim()
+}
+function Get-Bytes([string]$resp, [string]$prefix) {
+    foreach ($line in ($resp -split "[\r\n]+")) {
+        $h = ($line -replace '\s', '').ToUpper(); $k = $h.IndexOf($prefix)
+        if ($k -ge 0) { $d = $h.Substring($k + $prefix.Length)
+            if ($d.Length -ge 2) { return ,@(for ($n = 0; $n + 1 -lt $d.Length; $n += 2) { [Convert]::ToInt32($d.Substring($n, 2), 16) }) } }
+    }
+    $null
+}
+$Pids = @(
+ @{P='0104';N='Engine load';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='0105';N='Coolant temp';U='C';F={param($a)$a[0]-40}},
+ @{P='010C';N='RPM';U='rpm';F={param($a)[math]::Round((256*$a[0]+$a[1])/4)}},
+ @{P='010D';N='Speed';U='km/h';F={param($a)$a[0]}},
+ @{P='010F';N='Intake air temp';U='C';F={param($a)$a[0]-40}},
+ @{P='0110';N='MAF';U='g/s';F={param($a)[math]::Round((256*$a[0]+$a[1])/100,2)}},
+ @{P='0106';N='STFT bank 1';U='%';F={param($a)[math]::Round(($a[0]-128)*100/128,1)}},
+ @{P='0107';N='LTFT bank 1';U='%';F={param($a)[math]::Round(($a[0]-128)*100/128,1)}},
+ @{P='0108';N='STFT bank 2';U='%';F={param($a)[math]::Round(($a[0]-128)*100/128,1)}},
+ @{P='0109';N='LTFT bank 2';U='%';F={param($a)[math]::Round(($a[0]-128)*100/128,1)}},
+ @{P='010B';N='MAP';U='kPa';F={param($a)$a[0]}},
+ @{P='010E';N='Timing advance';U='deg';F={param($a)[math]::Round($a[0]/2-64,1)}},
+ @{P='0133';N='Baro';U='kPa';F={param($a)$a[0]}},
+ @{P='0144';N='Commanded lambda';U='';F={param($a)[math]::Round((256*$a[0]+$a[1])/32768,3)}},
+ @{P='0111';N='Throttle';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='012F';N='Fuel level';U='%';F={param($a)[math]::Round($a[0]*100/255,1)}},
+ @{P='015E';N='Fuel rate';U='L/h';F={param($a)[math]::Round((256*$a[0]+$a[1])/20,2)}},
+ @{P='0142';N='Module voltage';U='V';F={param($a)[math]::Round((256*$a[0]+$a[1])/1000,2)}}
+)
+function Read-Pid($d) { $b = Get-Bytes (Send-Obd $d.P 1500) ('41' + $d.P.Substring(2)); if ($null -eq $b) { $null } else { & $d.F $b } }
+function ConvertTo-Dtc([int]$hi, [int]$lo) { '{0}{1}{2:X}{3:X2}' -f ('P','C','B','U')[($hi -shr 6) -band 3], (($hi -shr 4) -band 3), ($hi -band 15), $lo }
+function Describe-Dtc([string]$c) {
+    $map = @{ P0171='System too lean, bank 1'; P0174='System too lean, bank 2'; P0172='System too rich, bank 1'; P0175='System too rich, bank 2';
+              P2177='System too lean off idle, bank 1'; P2179='System too lean off idle, bank 2'; P2178='System too rich off idle, bank 1'; P2180='System too rich off idle, bank 2';
+              P0300='Random/multiple cylinder misfire'; P0420='Catalyst efficiency below threshold, bank 1'; P0430='Catalyst efficiency below threshold, bank 2';
+              P0101='MAF sensor range/performance'; P0128='Coolant thermostat below regulating temp' }
+    if ($map.ContainsKey($c)) { return $map[$c] }
+    if ($c -match '^P030([1-8])$') { return "Cylinder $($Matches[1]) misfire detected" }
+    ''
+}
+
+# ---------- UI ----------
+$f = New-Object Windows.Forms.Form
+$f.Text = 'OBD2 Scanner'; $f.Size = '720,560'; $f.StartPosition = 'CenterScreen'; $f.Font = New-Object Drawing.Font('Segoe UI', 9)
+$top = New-Object Windows.Forms.Panel; $top.Dock = 'Top'; $top.Height = 40
+$lp = New-Object Windows.Forms.Label; $lp.Text = 'Port:'; $lp.Location = '10,12'; $lp.AutoSize = $true
+$cb = New-Object Windows.Forms.ComboBox; $cb.Location = '48,8'; $cb.Width = 90; $cb.DropDownStyle = 'DropDownList'
+$bc = New-Object Windows.Forms.Button; $bc.Text = 'Connect'; $bc.Location = '148,7'; $bc.Width = 90
+$st = New-Object Windows.Forms.Label; $st.Text = 'Not connected'; $st.Location = '250,12'; $st.AutoSize = $true
+$top.Controls.AddRange(@($lp, $cb, $bc, $st))
+$tabs = New-Object Windows.Forms.TabControl; $tabs.Dock = 'Fill'
+foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
+$f.Controls.Add($tabs); $f.Controls.Add($top)
+$tabs.BringToFront()
+
+# Live
+$lv = New-Object Windows.Forms.ListView; $lv.Dock = 'Fill'; $lv.View = 'Details'; $lv.FullRowSelect = $true; $lv.GridLines = $true
+[void]$lv.Columns.Add('Parameter', 260); [void]$lv.Columns.Add('Value', 140); [void]$lv.Columns.Add('Unit', 80)
+$tabs.TabPages[0].Controls.Add($lv)
+
+# Trims
+$bars = @{}; $y = 20
+foreach ($n in 'STFT bank 1','LTFT bank 1','STFT bank 2','LTFT bank 2') {
+    $l = New-Object Windows.Forms.Label; $l.Text = $n; $l.Location = "20,$y"; $l.AutoSize = $true
+    $pnl = New-Object Windows.Forms.Panel; $pnl.Location = "130,$($y-2)"; $pnl.Size = '400,24'; $pnl.BorderStyle = 'FixedSingle'; $pnl.BackColor = 'White'
+    $fill = New-Object Windows.Forms.Panel; $fill.Height = 22; $pnl.Controls.Add($fill)
+    $mid = New-Object Windows.Forms.Panel; $mid.Size = '1,24'; $mid.Location = '200,0'; $mid.BackColor = 'Gray'; $pnl.Controls.Add($mid); $mid.BringToFront()
+    $v = New-Object Windows.Forms.Label; $v.Location = "545,$y"; $v.AutoSize = $true; $v.Text = '--'
+    $tabs.TabPages[1].Controls.AddRange(@($l, $pnl, $v)); $bars[$n] = @{ Fill = $fill; Val = $v }; $y += 40
+}
+$note = New-Object Windows.Forms.Label; $note.Location = '20,190'; $note.Size = '650,120'
+$note.Text = "Scale: -30% to +30%. Near 0 is healthy.`r`nLong-term trim above about +10% means the ECU is adding fuel to fix a lean condition`r`n(vacuum leak, weak fuel delivery, dirty MAF, or ethanol fuel). At about +25% it is at its limit."
+$tabs.TabPages[1].Controls.Add($note)
+
+# Codes
+$lc = New-Object Windows.Forms.ListView; $lc.View = 'Details'; $lc.Location = '10,45'; $lc.Size = '670,380'; $lc.FullRowSelect = $true; $lc.GridLines = $true
+[void]$lc.Columns.Add('Code', 90); [void]$lc.Columns.Add('Type', 90); [void]$lc.Columns.Add('Description', 470)
+$br = New-Object Windows.Forms.Button; $br.Text = 'Read codes'; $br.Location = '10,10'; $br.Width = 110
+$bx = New-Object Windows.Forms.Button; $bx.Text = 'Clear codes'; $bx.Location = '130,10'; $bx.Width = 110
+$tabs.TabPages[2].Controls.AddRange(@($br, $bx, $lc))
+
+# Log
+$bl = New-Object Windows.Forms.Button; $bl.Text = 'Start logging'; $bl.Location = '10,10'; $bl.Width = 120
+$ll = New-Object Windows.Forms.Label; $ll.Location = '10,50'; $ll.Size = '670,60'; $ll.Text = "Saves a CSV to $LogDir. Open in Excel, or load into your tuning software."
+$tabs.TabPages[3].Controls.AddRange(@($bl, $ll))
+
+# Perf
+$bp = New-Object Windows.Forms.Button; $bp.Text = 'Arm run'; $bp.Location = '10,10'; $bp.Width = 120
+$pl = New-Object Windows.Forms.Label; $pl.Location = '10,50'; $pl.Size = '670,200'; $pl.Font = New-Object Drawing.Font('Consolas', 11)
+$pl.Text = 'Press Arm run, come to a stop on a closed course, then launch. Q-mile and 0-60 times are estimates (Bluetooth is slow).'
+$tabs.TabPages[4].Controls.AddRange(@($bp, $pl))
+
+# ---------- behavior ----------
+function Set-Status([string]$m) { $st.Text = $m }
+function Update-Bar($name, $val) {
+    $b = $bars[$name]; if (-not $b) { return }
+    $c = [math]::Max(-30, [math]::Min(30, $val)); $px = [int]([math]::Abs($c) / 30 * 200)
+    $b.Fill.Width = [math]::Max(1, $px); $b.Fill.Left = $(if ($c -ge 0) { 200 } else { 200 - $px })
+    $b.Fill.BackColor = $(if ([math]::Abs($val) -le 5) { 'SeaGreen' } elseif ([math]::Abs($val) -le 10) { 'Goldenrod' } else { 'Firebrick' })
+    $b.Val.Text = "$val %"
+}
+$bc.Add_Click({
+    if ($script:sp) { $timer.Stop(); $script:sp.Close(); $script:sp = $null; $bc.Text = 'Connect'; Set-Status 'Not connected'; return }
+    if (-not $cb.SelectedItem) { Set-Status 'Pick a COM port (pair the adapter in Windows first).'; return }
+    $f.Cursor = 'WaitCursor'; Set-Status 'Connecting...'; $f.Refresh()
+    try {
+        $s = New-Object System.IO.Ports.SerialPort $cb.SelectedItem, 38400, 'None', 8, 'One'; $s.ReadTimeout = 2000; $s.WriteTimeout = 2000; $s.Open(); $script:sp = $s
+        $r = Send-Obd 'ATZ' 3000
+        if ($r -notmatch 'ELM|OBD') { throw "No ELM327 response" }
+        foreach ($c in 'ATE0','ATL0','ATS0','ATH0','ATSP0') { [void](Send-Obd $c) }
+        Set-Status 'Finding supported sensors (a few seconds)...'; $f.Refresh()
+        $script:sup = @(); $lv.Items.Clear()
+        foreach ($d in $Pids) { if ($null -ne (Read-Pid $d)) { $script:sup += $d; $it = $lv.Items.Add($d.N); [void]$it.SubItems.Add('--'); [void]$it.SubItems.Add($d.U) } }
+        $bc.Text = 'Disconnect'; Set-Status "Connected on $($cb.SelectedItem) - $($script:sup.Count) sensors"; $script:i = 0; $timer.Start()
+    } catch { Set-Status "Error: $($_.Exception.Message)"; if ($script:sp) { $script:sp.Close(); $script:sp = $null } }
+    $f.Cursor = 'Default'
+})
+$br.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $timer.Stop(); $lc.Items.Clear()
+    foreach ($m in @(@('03','Stored'), @('07','Pending'))) {
+        $hdr = '{0:X2}' -f ([Convert]::ToInt32($m[0], 16) + 0x40)
+        foreach ($line in ((Send-Obd $m[0] 5000) -split "[\r\n]+")) {
+            $h = ($line -replace '\s', '').ToUpper()
+            if ($h.StartsWith($hdr)) { $d = $h.Substring(2); if ($d.Length % 4 -eq 2) { $d = $d.Substring(2) }
+                for ($k = 0; $k + 3 -lt $d.Length; $k += 4) { $hi = [Convert]::ToInt32($d.Substring($k, 2), 16); $lo = [Convert]::ToInt32($d.Substring($k + 2, 2), 16)
+                    if ($hi -or $lo) { $c = ConvertTo-Dtc $hi $lo; $it = $lc.Items.Add($c); [void]$it.SubItems.Add($m[1]); [void]$it.SubItems.Add((Describe-Dtc $c)) } } }
+        }
+    }
+    if ($lc.Items.Count -eq 0) { [void]$lc.Items.Add('(none)') }
+    $timer.Start()
+})
+$bx.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $q = [Windows.Forms.MessageBox]::Show("Clear codes and reset the check-engine light?`nThis also erases freeze-frame data and resets emissions readiness monitors.", 'Clear codes', 'YesNo', 'Warning')
+    if ($q -eq 'Yes') { $timer.Stop(); [void](Send-Obd '04' 4000); $lc.Items.Clear(); Set-Status 'Codes cleared.'; $timer.Start() }
+})
+$bl.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    if ($script:logW) { $script:logW.Close(); $script:logW = $null; $bl.Text = 'Start logging'; $ll.Text += "`r`nStopped."; return }
+    New-Item -ItemType Directory -Force $LogDir | Out-Null
+    $file = Join-Path $LogDir ("obd_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))
+    $script:logW = New-Object IO.StreamWriter $file; $script:logT = [Diagnostics.Stopwatch]::StartNew()
+    $script:logW.WriteLine((@('time_s') + ($script:sup | ForEach-Object { "$($_.N) [$($_.U)]" })) -join ',')
+    $bl.Text = 'Stop logging'; $ll.Text = "Logging to $file"
+})
+$bp.Add_Click({
+    if (-not $script:sp) { Set-Status 'Connect first.'; return }
+    $script:perf = @{ State = 'stop'; Dist = 0.0; Last = 0.0; LastV = 0.0; T60 = $null; TQ = $null; Top = 0.0; SW = $null }
+    $pl.Text = 'Waiting for the car to be stationary...'
+})
+
+$timer = New-Object Windows.Forms.Timer; $timer.Interval = 20
+$spdDef = $Pids | Where-Object { $_.P -eq '010D' }
+$timer.Add_Tick({
+    if (-not $script:sp -or $script:sup.Count -eq 0) { return }
+    $timer.Stop()
+    try {
+        if ($script:perf -and $script:perf.State -ne 'done') {
+            $p = $script:perf; $v = Read-Pid $spdDef
+            if ($null -ne $v) {
+                $mph = $v * 0.621371
+                switch ($p.State) {
+                    'stop'  { if ($v -eq 0) { $p.State = 'armed'; $pl.Text = 'ARMED - launch when ready.' } }
+                    'armed' { if ($v -gt 0) { $p.State = 'run'; $p.SW = [Diagnostics.Stopwatch]::StartNew() } }
+                    'run'   { $t = $p.SW.Elapsed.TotalSeconds
+                              $p.Dist += (($mph + $p.LastV) / 2) * 0.44704 * ($t - $p.Last); $p.Last = $t; $p.LastV = $mph; if ($mph -gt $p.Top) { $p.Top = $mph }
+                              if (-not $p.T60 -and $mph -ge 60) { $p.T60 = $t }
+                              if (-not $p.TQ -and $p.Dist -ge 402.336) { $p.TQ = $t; $p.TQs = $mph; $p.State = 'done' }
+                              if ($t -gt 40) { $p.State = 'done' }
+                              $pl.Text = ("Speed {0,5:N0} mph`r`nTime  {1,5:N1} s`r`n0-60  {2}`r`n1/4 mi {3}" -f $mph, $t, $(if ($p.T60) { '{0:N2} s' -f $p.T60 } else { '...' }), $(if ($p.TQ) { '{0:N2} s @ {1:N0} mph' -f $p.TQ, $p.TQs } else { '...' })) }
+                }
+                if ($p.State -eq 'done') { $pl.Text += "`r`nDone. Top speed $([math]::Round($p.Top)) mph." }
+            }
+        } else {
+            $d = $script:sup[$script:i]; $v = Read-Pid $d
+            $lv.Items[$script:i].SubItems[1].Text = $(if ($null -eq $v) { '--' } else { "$v" })
+            if ($null -ne $v) { $script:vals[$d.N] = $v; if ($bars.ContainsKey($d.N)) { Update-Bar $d.N $v } }
+            $script:i++
+            if ($script:i -ge $script:sup.Count) {
+                $script:i = 0
+                if ($script:logW) { $row = @([math]::Round($script:logT.Elapsed.TotalSeconds, 2)) + ($script:sup | ForEach-Object { $script:vals[$_.N] }); $script:logW.WriteLine($row -join ','); $script:logW.Flush() }
+            }
+        }
+    } catch { Set-Status "Connection error: $($_.Exception.Message)" }
+    if ($script:sp) { $timer.Start() }
+})
+
+$cb.Items.AddRange([string[]][System.IO.Ports.SerialPort]::GetPortNames()); if ($cb.Items.Count) { $cb.SelectedIndex = 0 }
+$f.Add_FormClosing({ $timer.Stop(); if ($script:logW) { $script:logW.Close() }; if ($script:sp) { $script:sp.Close() } })
+[void]$f.ShowDialog()

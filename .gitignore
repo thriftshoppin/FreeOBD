@@ -1,0 +1,6 @@
+﻿logs/
+*.csv
+!docs/*.csv
+.claude/
+*.exe
+*.log
