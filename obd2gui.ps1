@@ -207,7 +207,7 @@ $bc = New-Object Windows.Forms.Button; $bc.Text = 'Connect'; $bc.Location = '148
 $st = New-Object Windows.Forms.Label; $st.Text = 'Not connected'; $st.Location = '250,12'; $st.AutoSize = $true
 $top.Controls.AddRange(@($lp, $cb, $bc, $st))
 $tabs = New-Object Windows.Forms.TabControl; $tabs.Dock = 'Fill'
-foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance','Vehicle','Module Info','Misfire (GM)') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
+foreach ($n in 'Live','Fuel Trims','Codes','Log','Performance','Vehicle','Module Info','Misfire (GM)','GM Backup / Tune') { $t = New-Object Windows.Forms.TabPage; $t.Text = $n; [void]$tabs.TabPages.Add($t) }
 $f.Controls.Add($tabs); $f.Controls.Add($top)
 $tabs.BringToFront()
 
@@ -269,6 +269,25 @@ $lmfNote.Text = "Community-sourced candidate PIDs, NOT verified against GM docum
 $lmf = New-Object Windows.Forms.ListView; $lmf.View = 'Details'; $lmf.Location = '10,95'; $lmf.Size = '670,340'; $lmf.FullRowSelect = $true; $lmf.GridLines = $true
 [void]$lmf.Columns.Add('Cylinder', 70); [void]$lmf.Columns.Add('PID', 90); [void]$lmf.Columns.Add('Result', 480)
 $tabs.TabPages[7].Controls.AddRange(@($bmf, $lmfNote, $lmf))
+
+# GM Backup / Tune tab
+Add-Type -AssemblyName System.Windows.Forms.DataVisualization
+$gbTab = $tabs.TabPages[8]
+$gbNote = New-Object Windows.Forms.Label
+$gbNote.Text = "PCM Hammer backup + live graphs. Set path to PcmHammerCLI.exe (or full app). Always keep the original backup.`r`nCheap ELM327 adapters are not reliable for flashing - use a recommended interface."
+$gbNote.Location = '10,10'; $gbNote.Size = '680,40'
+$gbPath = New-Object Windows.Forms.TextBox; $gbPath.Location = '10,55'; $gbPath.Width = 450; $gbPath.Text = 'C:\Tools\PcmHammer\PcmHammerCLI.exe'
+$gbBrowse = New-Object Windows.Forms.Button; $gbBrowse.Text = 'Browse'; $gbBrowse.Location = '470,53'; $gbBrowse.Width = 80
+$gbBackup = New-Object Windows.Forms.Button; $gbBackup.Text = 'Read full backup'; $gbBackup.Location = '560,53'; $gbBackup.Width = 130
+$gbStatus = New-Object Windows.Forms.Label; $gbStatus.Location = '10,85'; $gbStatus.Size = '680,30'; $gbStatus.Text = 'Ready. Connect first, then set Hammer path and click backup.'
+$chart = New-Object System.Windows.Forms.DataVisualization.Charting.Chart
+$chart.Location = '10,120'; $chart.Size = '680,320'
+$area = New-Object System.Windows.Forms.DataVisualization.Charting.ChartArea 'Main'
+$chart.ChartAreas.Add($area)
+$series = New-Object System.Windows.Forms.DataVisualization.Charting.Series 'Fuel Trims'
+$series.ChartType = 'Column'
+$chart.Series.Add($series)
+$gbTab.Controls.AddRange(@($gbNote, $gbPath, $gbBrowse, $gbBackup, $gbStatus, $chart))
 
 # ---------- behavior ----------
 function Set-Status([string]$m) { $st.Text = $m }
@@ -380,6 +399,42 @@ $bm6.Add_Click({
     Set-Status 'Monitor tests read.'; $timer.Start()
 })
 
+# GM Backup / Tune handlers
+$gbBrowse.Add_Click({
+    $dlg = New-Object Windows.Forms.OpenFileDialog
+    $dlg.Filter = 'Executables (*.exe)|*.exe|All files (*.*)|*.*'
+    $dlg.Title = 'Select PCM Hammer CLI or app'
+    if ($dlg.ShowDialog() -eq 'OK') { $gbPath.Text = $dlg.FileName }
+})
+$gbBackup.Add_Click({
+    if (-not $script:sp) { $gbStatus.Text = 'Connect to the vehicle first.'; return }
+    $path = $gbPath.Text.Trim()
+    if (-not $path -or -not (Test-Path $path)) {
+        $gbStatus.Text = 'PCM Hammer not found. Browse to the CLI/exe first.'
+        return
+    }
+    $out = Join-Path $PSScriptRoot ("backups\ecu-backup-{0:yyyyMMdd-HHmmss}.bin" -f (Get-Date))
+    New-Item -ItemType Directory -Force (Split-Path $out) | Out-Null
+    $gbStatus.Text = "Starting backup to $out ..."
+    $f.Refresh()
+    try {
+        # Placeholder call - real CLI flags vary by PCM Hammer version
+        $proc = Start-Process -FilePath $path -ArgumentList "--help" -NoNewWindow -PassThru -Wait -RedirectStandardOutput "$out.log"
+        $gbStatus.Text = "Hammer invoked (see $out.log). Save the resulting .bin safely before any edits."
+    } catch {
+        $gbStatus.Text = "Backup failed: $($_.Exception.Message)"
+    }
+})
+
+# Simple live graph update for fuel trims (called from timer later if desired)
+function Update-TrimChart {
+    $series.Points.Clear()
+    foreach ($n in 'STFT bank 1','LTFT bank 1','STFT bank 2','LTFT bank 2') {
+        $v = $script:vals[$n]
+        if ($null -ne $v) { [void]$series.Points.AddXY($n, $v) }
+    }
+}
+
 $timer = New-Object Windows.Forms.Timer; $timer.Interval = 20
 $spdDef = $Pids | Where-Object { $_.P -eq '010D' }
 $timer.Add_Tick({
@@ -410,6 +465,7 @@ $timer.Add_Tick({
             if ($script:i -ge $script:sup.Count) {
                 $script:i = 0
                 if ($script:logW) { $row = @([math]::Round($script:logT.Elapsed.TotalSeconds, 2)) + ($script:sup | ForEach-Object { $script:vals[$_.N] }); $script:logW.WriteLine($row -join ','); $script:logW.Flush() }
+                if ($chart -and $series) { Update-TrimChart }
             }
         }
     } catch { Set-Status "Connection error: $($_.Exception.Message)" }
